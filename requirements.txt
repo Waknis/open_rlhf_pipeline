@@ -1,0 +1,14 @@
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.28.0
+datasets>=2.19.0
+trl>=0.8.6
+peft>=0.10.0
+sentencepiece>=0.2.0
+wandb>=0.16.0
+gradio>=4.31.0
+jinja2
+pyyaml
+scikit-learn
+detoxify==0.5.2
+numpy<2.0

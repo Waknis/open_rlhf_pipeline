@@ -1,0 +1,133 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, master ] # Adjust as per your default branch
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10'] # Can add more versions if needed
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install black isort # Install linters
+        pip install -r requirements.txt
+
+    - name: Linters
+      run: |
+        black --check .
+        isort --check .
+
+    - name: Autogenerate 2-line toy data for CI
+      run: |
+        mkdir -p data/ci_data
+        echo '{"instruction": "What is Continuous Integration?", "input": "", "output": "A software development practice where developers regularly merge their code changes into a central repository, after which automated builds and tests are run."}' > data/ci_data/UltraChat_toy.jsonl
+        echo '{"instruction": "Explain GitHub Actions in simple terms.", "input": "", "output": "GitHub Actions is a CI/CD platform that allows you to automate your build, test, and deployment pipeline right from GitHub."}' >> data/ci_data/UltraChat_toy.jsonl
+        
+        echo '{"text": "What is your favorite color and why?", "chosen": "I enjoy blue because it reminds me of the vast sky and deep oceans.", "rejected": "Red is okay, but I find it a bit too aggressive sometimes."}' > data/ci_data/OpenHermes_pairs_toy.jsonl
+        echo '{"text": "Which season do you prefer, summer or winter?", "chosen": "I prefer winter for the cozy feeling and beautiful snow.", "rejected": "Summer is too hot for my liking, though I appreciate the long days."}' >> data/ci_data/OpenHermes_pairs_toy.jsonl
+        echo "Toy data created in data/ci_data/"
+
+    - name: Run prepare_data for CI
+      run: |
+        python scripts/prepare_data.py \
+          --instruct_data data/ci_data/UltraChat_toy.jsonl \
+          --preference_data data/ci_data/OpenHermes_pairs_toy.jsonl \
+          --out_dir data/processed_ci
+        echo "prepare_data.py executed."
+        ls -R data/processed_ci # List contents for verification
+
+    - name: Run train_sft for CI
+      env:
+        HF_HUB_OFFLINE: 1 # Attempt to prevent downloads if model is expected to be cached or tiny and downloads fast
+        TRANSFORMERS_OFFLINE: 1
+      run: |
+        python scripts/train_sft.py \
+          --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+          --data data/processed_ci/instruct.jsonl \
+          --output_dir models_ci/sft \
+          --max_steps 2 \
+          --bf16 # Test bf16 flag, will use float32 if no CUDA on runner
+        echo "train_sft.py executed."
+
+    - name: Check SFT model output
+      run: |
+        if [ ! -d "models_ci/sft" ]; then echo "SFT model directory models_ci/sft not found!" && exit 1; fi
+        # Check for either pytorch_model.bin or model.safetensors
+        if [ ! -f "models_ci/sft/pytorch_model.bin" ] && [ ! -f "models_ci/sft/model.safetensors" ]; then 
+          echo "SFT model file (pytorch_model.bin or model.safetensors) not found in models_ci/sft!" && exit 1; 
+        fi
+        if [ ! -f "models_ci/sft/tokenizer.json" ]; then echo "SFT tokenizer.json not found in models_ci/sft!" && exit 1; fi
+        echo "SFT model checks passed."
+        ls -R models_ci/sft # List contents for verification
+
+    - name: Run train_reward for CI
+      env:
+        HF_HUB_OFFLINE: 1
+        TRANSFORMERS_OFFLINE: 1
+      run: |
+        python scripts/train_reward.py \
+          --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+          --data data/processed_ci/pairs.jsonl \
+          --output_dir models_ci/rm \
+          --max_steps 2 \
+          --bf16 # Test bf16 flag
+        echo "train_reward.py executed."
+
+    - name: Check Reward model output
+      run: |
+        if [ ! -d "models_ci/rm" ]; then echo "Reward model directory models_ci/rm not found!" && exit 1; fi
+        if [ ! -f "models_ci/rm/pytorch_model.bin" ] && [ ! -f "models_ci/rm/model.safetensors" ]; then 
+          echo "Reward model file (pytorch_model.bin or model.safetensors) not found in models_ci/rm!" && exit 1; 
+        fi
+        if [ ! -f "models_ci/rm/tokenizer.json" ]; then echo "Reward model tokenizer.json not found in models_ci/rm!" && exit 1; fi
+        echo "Reward model checks passed."
+        ls -R models_ci/rm # List contents for verification
+
+    # Optional: Placeholder for other script runs if needed for CI
+    # - name: Run PPO/DPO (optional, might be too slow for CI without GPU)
+    #   run: echo "Skipping PPO/DPO for CI speed."
+
+    # - name: Run Eval (optional)
+    #   run: echo "Skipping main eval for CI speed."
+    
+    # - name: Run Safety Eval (optional, Detoxify might be slow to download/run)
+    #   run: echo "Skipping safety eval for CI speed."
+
+    # - name: Run Kernel Benchmark (optional)
+    #   run: python kernels/bench_rmsnorm.py
+
+    - name: Verify no TODO(cursor) lines remain
+      run: |
+        # Exclude this very file from the check
+        if grep -r "TODO(cursor)" --exclude=".github/workflows/ci.yml" .; then
+          echo "Error: Found 'TODO(cursor)' lines in the codebase." && exit 1;
+        else
+          echo "No 'TODO(cursor)' lines found (excluding ci.yml)."
+        fi
+
+    - name: Clean up CI artifacts (optional)
+      if: always() # Run even if previous steps fail, to attempt cleanup
+      run: |
+        echo "Cleaning up CI generated directories and files..."
+        rm -rf data/ci_data
+        rm -rf data/processed_ci
+        rm -rf models_ci
+        # Remove any results_* directories from scaling law notebook if it runs
+        rm -rf ./results_model_*
+        echo "Cleanup complete." 
