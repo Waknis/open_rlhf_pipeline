@@ -29,11 +29,11 @@ open_rlhf_pipeline/
 
 ## Quick Start
 
-Important notes:
-
-- `pip install -r requirements.txt` installs the validated dependency set. The train/eval scripts fail fast if the installed stack drifts.
-- `scripts/prepare_data.py` writes canonical instruction rows with `prompt`, `response`, `text`, and preference rows with `prompt`, `chosen`, `rejected`.
-- The commands below are smoke-sized. They validate the pipeline; they do not produce a high-quality assistant.
+**Important Notes Before Starting:**
+*   **TRL Version:** This pipeline uses `trl>=0.8.6` as defined in `requirements.txt`. The PPO training script (`scripts/train_ppo.py`) is compatible with this version.
+*   **Dataset Acquisition:** The example commands below use placeholder dataset names (`UltraChat.jsonl`, `OpenHermes_pairs.jsonl`). You will need to procure or create your own datasets in the expected formats. The `scripts/prepare_data.py` script processes data from `data/` into `data/processed/`. Ensure your raw data (e.g., `UltraChat.jsonl`, `OpenHermes_pairs.jsonl`) is placed in the `data/` directory before running `prepare_data.py`.
+*   **Model Quality with Quick Start:** The quick start commands use minimal training steps (`--max_steps 2` or `--steps 2`). This is for rapidly testing the pipeline functionality and **will not produce a high-quality, usable chat model. Expect repetitive or nonsensical output from the web demo if using these minimal settings. For a functional model, significantly more training data and steps are required.**
+*   **Base Model:** The SFT script defaults to `tiny_llama` if no `--model` argument is provided. You can specify other Hugging Face model IDs or local paths.
 
 ```bash
 git clone https://github.com/your-handle/open_rlhf_pipeline.git
