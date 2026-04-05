@@ -1,120 +1,103 @@
-"""Prepare instruction and preference datasets for RLHF training.
+"""Prepare canonical instruction and preference datasets for RLHF training."""
 
-Reads raw JSONL files, processes them, and saves them to the output directory.
-Instruction data is formatted into a single 'text' field per example.
-Preference data is saved as pairs of 'chosen' and 'rejected' responses.
-"""
+from __future__ import annotations
 
 import argparse
-import json
 import pathlib
 import random
+import sys
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from open_rlhf.io import (  # noqa: E402
+    canonicalize_instruction_record,
+    canonicalize_preference_record,
+    load_jsonl,
+    save_jsonl,
+)
 
 
-def load_jsonl(path: pathlib.Path) -> list[dict]:
-    """Loads a JSONL file.
-
-    Args:
-        path: Path to the JSONL file.
-
-    Returns:
-        A list of dictionaries, where each dictionary is a record from the file.
-    """
-    with open(path, "r", encoding="utf-8") as f:
-        return [json.loads(l) for l in f]
-
-
-def save_jsonl(records: list[dict], path: pathlib.Path) -> None:
-    """Saves a list of records to a JSONL file.
-
-    Args:
-        records: A list of dictionaries to save.
-        path: Path to the output JSONL file.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
-def format_instruction(item: dict) -> dict:
-    """Formats an item from UltraChat-like data into a single 'text' field."""
-    instruction = item.get("instruction", "")
-    inp = item.get("input", "")
-    output = item.get("output", "")
-
-    if inp:
-        text = f"Instruction: {instruction}\nInput: {inp}\nOutput: {output}"
-    else:
-        text = f"Instruction: {instruction}\nOutput: {output}"
-    return {"text": text}
-
-
-def main():
-    """Main function to prepare data."""
-    ap = argparse.ArgumentParser(
-        description="Prepare instruction and preference datasets."
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(
+        description="Prepare canonical instruction and preference datasets."
     )
-    ap.add_argument(
+    parser.add_argument(
         "--instruct_data",
         type=pathlib.Path,
         required=True,
-        help="Path to the raw instruction JSONL file (e.g., UltraChat format).",
+        help="Path to raw instruction data with (`instruction`, `output`) or (`prompt`, `response`) fields.",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--preference_data",
         type=pathlib.Path,
         required=True,
-        help="Path to the raw preference JSONL file (e.g., OpenHermes_pairs format).",
+        help="Path to raw preference data with (`prompt`, `chosen`, `rejected`) fields.",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--out_dir",
         type=pathlib.Path,
         default=pathlib.Path("data/processed"),
-        help="Directory to save processed data.",
+        help="Directory where processed JSONL files will be written.",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--max_instruct_rows",
         type=int,
         default=5000,
-        help="Maximum number of rows for instruction data.",
+        help="Maximum number of instruction records to keep.",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--max_preference_rows",
         type=int,
         default=5000,
-        help="Maximum number of rows for preference data.",
+        help="Maximum number of preference records to keep.",
     )
-    args = ap.parse_args()
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used when shuffling input records.",
+    )
+    return parser.parse_args(argv)
 
+
+def _sample_records(records: list[dict], limit: int, seed: int) -> list[dict]:
+    rng = random.Random(seed)
+    sampled = list(records)
+    rng.shuffle(sampled)
+    return sampled[:limit]
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run data preparation and write the canonical processed files."""
+    args = parse_args(argv)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Process instruction data
-    raw_instruct_data = load_jsonl(args.instruct_data)
-    random.shuffle(raw_instruct_data)
-    processed_instruct_data = [
-        format_instruction(item) for item in raw_instruct_data[: args.max_instruct_rows]
+    instruct_records = _sample_records(
+        load_jsonl(args.instruct_data), args.max_instruct_rows, args.seed
+    )
+    preference_records = _sample_records(
+        load_jsonl(args.preference_data), args.max_preference_rows, args.seed
+    )
+
+    processed_instruct = [
+        canonicalize_instruction_record(record) for record in instruct_records
     ]
-    instruct_out_path = args.out_dir / "instruct.jsonl"
-    save_jsonl(processed_instruct_data, instruct_out_path)
+    processed_preferences = [
+        canonicalize_preference_record(record) for record in preference_records
+    ]
 
-    # Process preference data
-    raw_preference_data = load_jsonl(args.preference_data)
-    random.shuffle(raw_preference_data)
+    save_jsonl(processed_instruct, args.out_dir / "instruct.jsonl")
+    save_jsonl(processed_preferences, args.out_dir / "pairs.jsonl")
 
-    # Rename "prompt" to "text" if "prompt" exists and "text" doesn't
-    processed_preference_list = []
-    for item in raw_preference_data[: args.max_preference_rows]:
-        new_item = item.copy()
-        if "prompt" in new_item and "text" not in new_item:
-            new_item["text"] = new_item.pop("prompt")
-        processed_preference_list.append(new_item)
-
-    preference_out_path = args.out_dir / "pairs.jsonl"
-    save_jsonl(processed_preference_list, preference_out_path)
-
-    print(f"✓ Data written to {args.out_dir}")
+    print(
+        f"Prepared {len(processed_instruct)} instruction rows and "
+        f"{len(processed_preferences)} preference rows in {args.out_dir}."
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

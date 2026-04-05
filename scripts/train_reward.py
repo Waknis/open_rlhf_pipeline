@@ -1,155 +1,146 @@
-"""Train a reward model on preference pairs."""
+"""Train a reward model on canonical preference pairs."""
+
+from __future__ import annotations
 
 import argparse
 import pathlib
+import sys
 
-import torch
 from datasets import load_dataset
-from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
-                          TrainingArguments)
-from trl import RewardTrainer
-from trl.trainer.utils import RewardDataCollatorWithPadding
+from transformers import AutoModelForSequenceClassification
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from open_rlhf.formatting import render_prompt_response  # noqa: E402
+from open_rlhf.runtime import (  # noqa: E402
+    add_runtime_args,
+    ensure_validated_stack,
+    load_tokenizer,
+    resolve_runtime,
+    seed_everything,
+)
 
 
-def main() -> None:
-    """Main function to train the reward model."""
-    ap = argparse.ArgumentParser(
-        description="Train a reward model on preference pairs."
-    )
-    ap.add_argument(
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(description="Train a reward model on preference pairs.")
+    parser.add_argument(
         "--model",
         type=str,
-        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # Can also be a path to a local SFT model
-        help="Hugging Face model ID or local path to the base model for the reward head.",
+        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        help="Base Hugging Face model ID or local checkpoint used for the reward head.",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--data",
         type=pathlib.Path,
         default=pathlib.Path("data/processed/pairs.jsonl"),
-        help="Path to the JSONL file containing preference pairs ('chosen' and 'rejected' fields).",
+        help="Processed preference data with canonical (`prompt`, `chosen`, `rejected`) fields.",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--output_dir",
         type=pathlib.Path,
         default=pathlib.Path("models/rm"),
-        help="Directory to save the trained reward model.",
+        help="Directory where the reward model will be saved.",
     )
-    ap.add_argument(
-        "--max_steps", type=int, default=2, help="Maximum number of training steps."
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=2,
+        help="Maximum training steps.",
     )
-    ap.add_argument(
-        "--bf16",
-        action="store_true",
-        help="Enable bfloat16 training if CUDA is available.",
+    parser.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        default=2,
+        help="Per-device train batch size.",
     )
-    args = ap.parse_args()
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=5e-6,
+        help="Optimizer learning rate.",
+    )
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=512,
+        help="Maximum sequence length used by the default reward data collator.",
+    )
+    add_runtime_args(parser)
+    return parser.parse_args(argv)
 
+
+def main(argv: list[str] | None = None) -> int:
+    """Run reward modeling."""
+    args = parse_args(argv)
+    ensure_validated_stack(require_trl=True)
+    runtime = resolve_runtime(args.device, args.dtype)
+    seed_everything(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token is None:
-        # Set pad token for models like Llama, needed for padding during tokenization
-        tokenizer.pad_token = tokenizer.eos_token
-        # Ensure model's config also reflects this if it's used for generation later (not crucial for RM training)
-        # model_config = AutoConfig.from_pretrained(args.model)
-        # model_config.pad_token_id = tokenizer.pad_token_id
+    from trl import RewardConfig, RewardTrainer
 
-    model_dtype = torch.float32
-    training_bf16 = False
-    if args.bf16:
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            model_dtype = torch.bfloat16
-            training_bf16 = True
-            print("CUDA and bfloat16 available. Using bfloat16 for model and training.")
-        else:
-            print(
-                "BF16 requested, but CUDA or bfloat16 support not available. Using float32."
-            )
-    else:
-        print("Using float32 for model and training.")
-
+    tokenizer = load_tokenizer(args.model, padding_side="right")
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model,
-        num_labels=1,  # Regression head for reward score
-        torch_dtype=model_dtype,
+        num_labels=1,
+        torch_dtype=runtime.torch_dtype,
     )
-    # If pad_token was added to tokenizer, and model has a config for pad_token_id, update it.
-    # This can be important if the model was not initialized with a pad_token_id in its config.
     if tokenizer.pad_token_id is not None and model.config.pad_token_id is None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
-    # Load and preprocess dataset
     dataset = load_dataset("json", data_files=str(args.data))["train"]
+    required_columns = {"prompt", "chosen", "rejected"}
+    if not required_columns.issubset(set(dataset.column_names)):
+        raise ValueError(
+            f"Reward training expects canonical preference rows with {sorted(required_columns)}. "
+            f"Found {dataset.column_names}."
+        )
 
-    def preprocess_function(examples):
-        """Tokenizes chosen and rejected texts for the RewardTrainer."""
-        tokenized_chosen = tokenizer(
-            examples["chosen"], truncation=True, padding="max_length", max_length=256
-        )
-        tokenized_rejected = tokenizer(
-            examples["rejected"], truncation=True, padding="max_length", max_length=256
-        )
+    def prepare_example(example: dict) -> dict:
         return {
-            "input_ids_chosen": tokenized_chosen["input_ids"],
-            "attention_mask_chosen": tokenized_chosen["attention_mask"],
-            "input_ids_rejected": tokenized_rejected["input_ids"],
-            "attention_mask_rejected": tokenized_rejected["attention_mask"],
+            "chosen": render_prompt_response(tokenizer, example["prompt"], example["chosen"]),
+            "rejected": render_prompt_response(tokenizer, example["prompt"], example["rejected"]),
         }
 
-    tokenized_dataset = dataset.map(
-        preprocess_function,
-        batched=True,
-        remove_columns=dataset.column_names,  # Remove original 'chosen', 'rejected' text columns
+    prepared_dataset = dataset.map(
+        prepare_example,
+        remove_columns=dataset.column_names,
     )
-    # RewardTrainer expects columns to be torch tensors
-    tokenized_dataset.set_format("torch")
 
-    # Ensure per_device_train_batch_size is not greater than the dataset size
-    effective_batch_size = 1
-    # if len(tokenized_dataset) >= 2:
-    #     effective_batch_size = 2
-
-    training_args = TrainingArguments(
+    training_args = RewardConfig(
         output_dir=str(args.output_dir),
         max_steps=args.max_steps,
-        per_device_train_batch_size=effective_batch_size,  # For RewardTrainer, this is pairs per batch
-        gradient_accumulation_steps=1,
-        learning_rate=5e-6,  # Typically lower LR for RM than SFT
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        learning_rate=args.learning_rate,
         logging_steps=1,
         save_strategy="steps",
-        save_steps=args.max_steps,
-        bf16=training_bf16,
-        fp16=False,
-        optim="adamw_torch",
-        report_to="none",
+        save_steps=max(1, args.max_steps),
         save_total_limit=1,
-        remove_unused_columns=False, # Explicitly set to False for RewardTrainer
+        report_to="none",
+        max_length=args.max_length,
+        bf16=runtime.bf16,
+        fp16=runtime.fp16,
+        use_cpu=runtime.use_cpu,
+        use_mps_device=runtime.use_mps_device,
+        seed=args.seed,
+        remove_unused_columns=False,
     )
-
-    # TRL's RewardTrainer (as of 0.17.0) checks for args.disable_dropout internally.
-    # Standard TrainingArguments doesn't have this, so we add it.
-    if not hasattr(training_args, 'disable_dropout'):
-        training_args.disable_dropout = False
-    # TRL's RewardTrainer also checks for args.center_rewards_coefficient.
-    if not hasattr(training_args, 'center_rewards_coefficient'):
-        training_args.center_rewards_coefficient = None
-
-    # Explicitly create the data collator if RewardTrainer's default expects processing_class implicitly
-    # and doesn't take tokenizer directly in the constructor for this version of TRL.
-    data_collator = RewardDataCollatorWithPadding(tokenizer=tokenizer, padding=True)
 
     trainer = RewardTrainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset,
-        data_collator=data_collator, # Pass the instantiated collator
+        train_dataset=prepared_dataset,
+        processing_class=tokenizer,
     )
-
     trainer.train()
-    trainer.save_model(str(args.output_dir))  # Saves model
-    tokenizer.save_pretrained(str(args.output_dir)) # Manually save tokenizer as it's not passed to trainer
-    print("✓ Reward done")
+    trainer.save_model(str(args.output_dir))
+    tokenizer.save_pretrained(str(args.output_dir))
+    print(f"Reward model saved to {args.output_dir}.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

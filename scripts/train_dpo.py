@@ -1,165 +1,168 @@
-"""Train a policy model using Direct Preference Optimization (DPO)."""
+"""Train a policy model with Direct Preference Optimization."""
+
+from __future__ import annotations
 
 import argparse
 import pathlib
+import sys
 
-import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
-from trl import DPOTrainer
+from transformers import AutoModelForCausalLM
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from open_rlhf.formatting import render_prompt  # noqa: E402
+from open_rlhf.runtime import (  # noqa: E402
+    add_runtime_args,
+    ensure_validated_stack,
+    load_tokenizer,
+    resolve_runtime,
+    seed_everything,
+)
 
 
-def main() -> None:
-    """Main function to run DPO training."""
-    ap = argparse.ArgumentParser(description="Train a policy model using DPO.")
-    ap.add_argument(
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(description="Train a policy model using DPO.")
+    parser.add_argument(
         "--policy",
         type=str,
-        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # Can also be SFT model path
-        help="Hugging Face model ID or local path to the base model to be DPO-trained.",
+        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        help="Base Hugging Face model ID or local checkpoint.",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--pairs",
         type=pathlib.Path,
         default=pathlib.Path("data/processed/pairs.jsonl"),
-        help="Path to the JSONL file with preference data ('text', 'chosen', 'rejected' fields).",
+        help="Processed preference data with canonical (`prompt`, `chosen`, `rejected`) fields.",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--output_dir",
         type=pathlib.Path,
         default=pathlib.Path("models/dpo"),
-        help="Directory to save the trained DPO model.",
+        help="Directory where the trained DPO model will be saved.",
     )
-    ap.add_argument(
-        "--steps",  # Renamed from max_steps in user req to be consistent with PPO script arg name
+    parser.add_argument(
+        "--steps",
         type=int,
         default=2,
-        help="Maximum number of training steps (optimization updates).",
+        help="Maximum optimization steps.",
     )
-    ap.add_argument(
-        "--bf16",
-        action="store_true",
-        help="Enable bfloat16 training if CUDA is available.",
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=0.1,
+        help="DPO beta hyperparameter.",
     )
-    # DPO-specific HPs, can be exposed more if needed
-    ap.add_argument("--beta", type=float, default=0.1, help="DPO beta hyperparameter.")
-    ap.add_argument(
+    parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-7,
-        help="DPO learning rate (often very small).",
-    )  # DPO often needs smaller LR
-    ap.add_argument(
-        "--dpo_batch_size",
+        default=1e-6,
+        help="Optimizer learning rate.",
+    )
+    parser.add_argument(
+        "--per_device_train_batch_size",
         type=int,
         default=1,
-        help="DPO per device batch size (pairs per batch).",
-    )  # DPO often uses batch_size=1 or 2
+        help="Per-device train batch size.",
+    )
+    parser.add_argument(
+        "--max_prompt_length",
+        type=int,
+        default=256,
+        help="Maximum prompt length used by DPO tokenization.",
+    )
+    parser.add_argument(
+        "--max_completion_length",
+        type=int,
+        default=256,
+        help="Maximum completion length used by DPO tokenization.",
+    )
+    add_runtime_args(parser)
+    return parser.parse_args(argv)
 
-    args = ap.parse_args()
 
+def main(argv: list[str] | None = None) -> int:
+    """Run DPO training."""
+    args = parse_args(argv)
+    ensure_validated_stack(require_trl=True)
+    runtime = resolve_runtime(args.device, args.dtype)
+    seed_everything(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Dtype handling
-    model_dtype = torch.float32
-    training_bf16 = False
-    if args.bf16:
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            model_dtype = torch.bfloat16
-            training_bf16 = True
-            print("CUDA and bfloat16 available. Using bfloat16 for model and training.")
-        else:
-            print(
-                "BF16 requested, but CUDA or bfloat16 support not available. Using float32."
-            )
-    else:
-        print("Using float32 for model and training.")
+    from trl import DPOConfig, DPOTrainer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.policy)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        # DPO Trainer might also need model.config.pad_token_id if using pad_token for attention masking.
-        # print("Set pad_token to eos_token.")
-
+    tokenizer = load_tokenizer(args.policy, padding_side="right")
     model = AutoModelForCausalLM.from_pretrained(
         args.policy,
-        torch_dtype=model_dtype,
-        # low_cpu_mem_usage=True, # Can be useful for large models
+        torch_dtype=runtime.torch_dtype,
+    )
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        args.policy,
+        torch_dtype=runtime.torch_dtype,
     )
     if tokenizer.pad_token_id is not None and model.config.pad_token_id is None:
         model.config.pad_token_id = tokenizer.pad_token_id
-        # print(f"Set model.config.pad_token_id to {tokenizer.pad_token_id}")
+    if tokenizer.pad_token_id is not None and ref_model.config.pad_token_id is None:
+        ref_model.config.pad_token_id = tokenizer.pad_token_id
 
-    # Load dataset
-    # DPOTrainer expects 'prompt', 'chosen', 'rejected' columns.
-    # Our pairs.jsonl (from OpenHermes_pairs structure) should have these.
-    # UPDATE: pairs.jsonl will now have 'text', 'chosen', 'rejected' due to prepare_data.py change.
     dataset = load_dataset("json", data_files=str(args.pairs))["train"]
-
-    # Rename 'text' to 'prompt' if necessary for DPOTrainer
-    if "text" in dataset.column_names and "prompt" not in dataset.column_names:
-        dataset = dataset.rename_column("text", "prompt")
-        print("Renamed dataset column 'text' to 'prompt' for DPOTrainer.")
-    elif "prompt" not in dataset.column_names:
-        # This case should ideally not happen if data prep is correct and only one prompt field exists.
-        print(
-            "Warning: 'prompt' column not found and 'text' column also not found to rename. DPOTrainer might fail."
+    required_columns = {"prompt", "chosen", "rejected"}
+    if not required_columns.issubset(set(dataset.column_names)):
+        raise ValueError(
+            f"DPO training expects canonical preference rows with {sorted(required_columns)}. "
+            f"Found {dataset.column_names}."
         )
 
-    # Ensure batch size is not larger than dataset size for toy runs
-    # Dataset has 2 lines for the toy example.
-    actual_dpo_batch_size = min(args.dpo_batch_size, len(dataset))
-    if (
-        actual_dpo_batch_size == 0 and len(dataset) > 0
-    ):  # handle case where dataset is small but >0
-        actual_dpo_batch_size = 1
-    elif len(dataset) == 0:
-        print("Error: Dataset is empty. Cannot train.")
-        return
+    def prepare_example(example: dict) -> dict:
+        return {
+            "prompt": render_prompt(tokenizer, example["prompt"]),
+            "chosen": example["chosen"].strip(),
+            "rejected": example["rejected"].strip(),
+        }
 
-    # DPO Training Arguments
-    # DPOTrainer uses a DPOConfig which subclasses TrainingArguments.
-    training_args = TrainingArguments(
+    prepared_dataset = dataset.map(
+        prepare_example,
+        remove_columns=dataset.column_names,
+    )
+
+    training_args = DPOConfig(
         output_dir=str(args.output_dir),
-        per_device_train_batch_size=actual_dpo_batch_size,
         max_steps=args.steps,
+        per_device_train_batch_size=args.per_device_train_batch_size,
         learning_rate=args.learning_rate,
-        gradient_accumulation_steps=1,  # Keep it 1 for tiny batch and few steps
+        beta=args.beta,
         logging_steps=1,
         save_strategy="steps",
-        save_steps=args.steps,  # Save at the end of training
-        bf16=training_bf16,
-        fp16=False,
-        optim="adamw_torch",
-        report_to="none",
+        save_steps=max(1, args.steps),
         save_total_limit=1,
-        remove_unused_columns=False,  # Important as dataset might have other cols from json load
+        report_to="none",
+        max_prompt_length=args.max_prompt_length,
+        max_completion_length=args.max_completion_length,
+        max_length=args.max_prompt_length + args.max_completion_length,
+        bf16=runtime.bf16,
+        fp16=runtime.fp16,
+        use_cpu=runtime.use_cpu,
+        use_mps_device=runtime.use_mps_device,
+        seed=args.seed,
+        remove_unused_columns=False,
     )
 
-    # Initialize DPOTrainer
-    dpo_trainer = DPOTrainer(
+    trainer = DPOTrainer(
         model=model,
-        # ref_model=None, # DPOTrainer creates its own reference model if None
-        args=training_args,  # Pass TrainingArguments here
-        beta=args.beta,
-        train_dataset=dataset,
-        tokenizer=tokenizer,
-        max_length=1024,  # Max sequence length for (prompt + chosen/rejected)
-        max_prompt_length=512,  # Max length for prompt part
-        # peft_config=None, # Can pass PEFT config for LoRA DPO
+        ref_model=ref_model,
+        args=training_args,
+        train_dataset=prepared_dataset,
+        processing_class=tokenizer,
     )
-
-    print(f"Starting DPO training for {args.steps} steps...")
-    dpo_trainer.train()
-
-    print(f"Saving DPO model to {args.output_dir}...")
-    dpo_trainer.save_model(
-        str(args.output_dir)
-    )  # Saves model and tokenizer (if passed)
-    # tokenizer.save_pretrained(str(args.output_dir)) # Not needed if tokenizer passed to DPOTrainer
-
-    print("✓ DPO done")
+    trainer.train()
+    trainer.save_model(str(args.output_dir))
+    tokenizer.save_pretrained(str(args.output_dir))
+    print(f"DPO model saved to {args.output_dir}.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

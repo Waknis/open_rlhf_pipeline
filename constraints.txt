@@ -1,0 +1,16 @@
+accelerate==1.10.0
+datasets==4.0.0
+detoxify==0.5.2
+gradio==5.47.0
+jinja2==3.1.6
+numpy==1.26.4
+packaging==24.2
+peft==0.17.0
+pytest==8.4.1
+pyyaml==6.0.2
+scikit-learn==1.7.1
+sentencepiece==0.2.0
+torch==2.8.0
+transformers==4.46.3
+trl==0.12.2
+wandb==0.21.1

@@ -1,160 +1,170 @@
-"""Run dummy evaluations on a trained model and generate a markdown report."""
+"""Run sample-generation smoke evaluation on a trained model."""
+
+from __future__ import annotations
 
 import argparse
+import json
 import pathlib
+import sys
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, GenerationConfig
 
-DUMMY_TASKS = {
-    "MMLU": [
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from open_rlhf.formatting import render_prompt  # noqa: E402
+from open_rlhf.runtime import (  # noqa: E402
+    add_runtime_args,
+    ensure_validated_stack,
+    load_tokenizer,
+    make_torch_device,
+    resolve_runtime,
+    seed_everything,
+)
+
+SAMPLE_TASKS = {
+    "factual": [
         "What is the capital of France?",
-        "Explain the theory of relativity in simple terms.",
+        "Name one use of supervised fine-tuning.",
     ],
-    "ARC-Easy": [
-        "Which planet is known as the Red Planet?",
-        "What force keeps us on the ground?",
+    "reasoning": [
+        "If a model overfits, what is one likely symptom?",
+        "Why might PPO be less stable than DPO on a tiny dataset?",
     ],
-    "TruthfulQA": [
-        "What happens if you mix baking soda and vinegar?",
-        "Can birds fly to the moon?",
-    ],
-    "AlpacaEval": [
-        "Write a short story about a friendly robot.",
-        "Summarize the plot of 'Hamlet' in three sentences.",
+    "helpfulness": [
+        "Write a short explanation of RLHF for a junior engineer.",
+        "Summarize the difference between a reward model and a policy model in two sentences.",
     ],
 }
 
 
-def generate_response(
-    model,
-    tokenizer,
-    prompt: str,
-    device: torch.device,
-    generation_config: GenerationConfig,
-) -> str:
-    """Generates a response from the model for a given prompt."""
-    inputs = tokenizer(
-        prompt, return_tensors="pt", padding=True, truncation=True, max_length=512
-    ).to(device)
-
-    # Ensure attention_mask is passed if inputs includes it (tokenizer usually provides it)
-    gen_kwargs = {"attention_mask": inputs.get("attention_mask", None)}
-
-    with torch.no_grad():
-        output_sequences = model.generate(
-            input_ids=inputs["input_ids"],
-            generation_config=generation_config,
-            **gen_kwargs,
-        )
-
-    # Decode only the newly generated tokens, not the prompt
-    response_text = tokenizer.decode(
-        output_sequences[0, inputs["input_ids"].shape[-1] :], skip_special_tokens=True
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(description="Run sample-generation smoke evaluation.")
+    parser.add_argument(
+        "--model",
+        type=pathlib.Path,
+        default=None,
+        help="Path to the trained Hugging Face model checkpoint.",
     )
-    return response_text.strip()
-
-
-def main() -> None:
-    """Main function to run evaluations."""
-    ap = argparse.ArgumentParser(
-        description="Run dummy evaluations and generate a report."
-    )
-    ap.add_argument(
+    parser.add_argument(
         "--model_path",
         type=pathlib.Path,
-        required=True,
-        help="Path to the trained Hugging Face model (e.g., models/ppo or models/dpo).",
+        default=None,
+        help="Deprecated alias for --model.",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--output_dir",
         type=pathlib.Path,
         default=pathlib.Path("eval/reports"),
-        help="Directory to save the evaluation report.",
+        help="Directory where the sample report will be written.",
     )
-    ap.add_argument(
-        "--bf16",
-        action="store_true",
-        help="Load model in bfloat16 if CUDA is available (for faster inference on compatible GPUs).",
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=64,
+        help="Maximum generated tokens per prompt.",
     )
-    args = ap.parse_args()
+    add_runtime_args(parser)
+    return parser.parse_args(argv)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_dtype = torch.float32
-    if args.bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported():
-        model_dtype = torch.bfloat16
-        print("Using bfloat16 for model loading.")
-    else:
-        print("Using float32 for model loading.")
+def _resolve_model_path(args: argparse.Namespace) -> pathlib.Path:
+    model_path = args.model or args.model_path
+    if model_path is None:
+        raise SystemExit("Provide `--model` (or the deprecated alias `--model_path`).")
+    return model_path
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_path, torch_dtype=model_dtype
-        )
-        model.to(device)
-        model.eval()
-    except Exception as e:
-        print(f"Error loading model from {args.model_path}: {e}")
-        return
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        if model.config.pad_token_id is None:  # Important for generation
-            model.config.pad_token_id = tokenizer.pad_token_id
-
+def _generate_response(model, tokenizer, prompt: str, device: torch.device, max_new_tokens: int) -> str:
+    prompt_text = render_prompt(tokenizer, prompt)
+    inputs = tokenizer(
+        prompt_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+        add_special_tokens=False,
+    ).to(device)
     generation_config = GenerationConfig(
-        max_new_tokens=100,
-        min_new_tokens=10,
-        temperature=0.7,
-        top_p=0.9,
-        do_sample=True,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs.get("attention_mask"),
+            generation_config=generation_config,
+        )
+    response_ids = outputs[0, inputs["input_ids"].shape[-1] :]
+    return tokenizer.decode(response_ids, skip_special_tokens=True).strip()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run sample-generation smoke evaluation and write a report."""
+    args = parse_args(argv)
+    ensure_validated_stack(require_trl=False)
+    runtime = resolve_runtime(args.device, args.dtype)
+    seed_everything(args.seed)
+    model_path = _resolve_model_path(args)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    tokenizer = load_tokenizer(str(model_path), padding_side="left")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=runtime.torch_dtype,
+    )
+    device = make_torch_device(runtime)
+    model.to(device)
+    model.eval()
+    if tokenizer.pad_token_id is not None and model.config.pad_token_id is None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+    results: list[dict[str, str]] = []
+    for task_name, prompts in SAMPLE_TASKS.items():
+        for prompt in prompts:
+            results.append(
+                {
+                    "task": task_name,
+                    "prompt": prompt,
+                    "response": _generate_response(
+                        model,
+                        tokenizer,
+                        prompt,
+                        device,
+                        args.max_new_tokens,
+                    ),
+                }
+            )
 
     report_lines = [
-        "# Evaluation Report",
+        "# Sample Generation Report",
         "",
-        f"Model: `{args.model_path}`",
+        "This report is a smoke test of prompt formatting and generation. It is not a benchmark score.",
         "",
-        "| Task         | Question                                              | Model Response                                     |",
-        "|--------------|-------------------------------------------------------|----------------------------------------------------|",
+        f"Model: `{model_path}`",
+        "",
+        "| Category | Prompt | Response |",
+        "|---|---|---|",
     ]
-
-    print(f"Generating responses for model: {args.model_path}")
-    for task_name, questions in DUMMY_TASKS.items():
-        print(f"  Evaluating task: {task_name}...")
-        for q_idx, question in enumerate(questions):
-            # For chat models, prompt might need specific formatting. Assuming generic completion for now.
-            # E.g. for TinyLlama chat: prompt = f"<|user|>\n{question}<|assistant|>\n"
-            # For this general script, we use the question directly as prompt.
-            prompt = question
-            response = generate_response(
-                model, tokenizer, prompt, device, generation_config
-            )
-            # Truncate long responses for display in table
-            display_response = (
-                (response[:150] + "...") if len(response) > 150 else response
-            )
-            display_response = display_response.replace(
-                "|", "\|"
-            )  # Escape pipe characters for markdown
-            display_question = question.replace("|", "\|")
-            report_lines.append(
-                f"| {task_name:<12} | {display_question:<53} | {display_response:<50} |"
-            )
-            print(f"    Q{q_idx+1}: {question}")
-            print(f"    R{q_idx+1}: {response[:80]}...")
+    for record in results:
+        prompt = record["prompt"].replace("|", "\\|")
+        response = record["response"].replace("|", "\\|")
+        report_lines.append(f"| {record['task']} | {prompt} | {response} |")
 
     report_path = args.output_dir / "report.md"
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(report_lines))
+    jsonl_path = args.output_dir / "responses.jsonl"
+    report_path.write_text("\n".join(report_lines), encoding="utf-8")
+    with jsonl_path.open("w", encoding="utf-8") as handle:
+        for record in results:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    print(f"\n✓ Evaluation report written to {report_path}")
+    print(f"Sample evaluation written to {report_path}.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
