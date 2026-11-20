@@ -15,22 +15,22 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install validated stack
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -c constraints.txt torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
 
       - name: Compile Python entrypoints
         run: |
           python -m compileall open_rlhf scripts eval web_demo
 
       - name: Run pipeline smoke tests
-        run: |
-          python -m pytest -q
+        run: bash tools/smoke_test.sh

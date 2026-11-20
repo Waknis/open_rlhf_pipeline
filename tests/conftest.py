@@ -6,12 +6,13 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
+from tokenizers import ByteLevelBPETokenizer
+from transformers import GPT2Config, GPT2LMHeadModel, GPT2TokenizerFast
 
 from scripts.prepare_data import main as prepare_data_main
 from scripts.train_reward import main as train_reward_main
 from scripts.train_sft import _tokenize_structured_example, main as train_sft_main
-
-MODEL_ID = "sshleifer/tiny-gpt2"
 
 
 def assert_model_artifacts(model_dir: Path) -> None:
@@ -20,6 +21,35 @@ def assert_model_artifacts(model_dir: Path) -> None:
     assert (model_dir / "config.json").exists()
     assert (model_dir / "tokenizer_config.json").exists()
     assert (model_dir / "model.safetensors").exists() or (model_dir / "pytorch_model.bin").exists()
+
+
+@pytest.fixture(scope="session")
+def base_checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build a deterministic, offline GPT-2 model and byte-level tokenizer."""
+    path = tmp_path_factory.mktemp("tiny_gpt2")
+    bpe = ByteLevelBPETokenizer()
+    bpe.train_from_iterator(
+        ["User: Explain what RLHF is.\nAssistant: RLHF uses preference feedback."],
+        vocab_size=300,
+        min_frequency=1,
+        special_tokens=["<|endoftext|>"],
+    )
+    bpe.save_model(str(path))
+    tokenizer = GPT2TokenizerFast.from_pretrained(str(path))
+    tokenizer.save_pretrained(path)
+    config = GPT2Config(
+        vocab_size=len(tokenizer),
+        n_positions=256,
+        n_embd=16,
+        n_layer=1,
+        n_head=2,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    with torch.random.fork_rng(devices=[]):
+        torch.random.default_generator.manual_seed(7)
+        GPT2LMHeadModel(config).save_pretrained(path)
+    return path
 
 
 @pytest.fixture(scope="session")
@@ -82,13 +112,15 @@ def processed_data_dir(raw_data_dir: Path, tmp_path_factory: pytest.TempPathFact
 
 
 @pytest.fixture(scope="session")
-def sft_checkpoint(processed_data_dir: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+def sft_checkpoint(
+    base_checkpoint: Path, processed_data_dir: Path, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
     """Train a tiny SFT checkpoint for downstream smoke tests."""
     output_dir = tmp_path_factory.mktemp("sft_model")
     exit_code = train_sft_main(
         [
             "--model",
-            MODEL_ID,
+            str(base_checkpoint),
             "--data",
             str(processed_data_dir / "instruct.jsonl"),
             "--output_dir",
@@ -140,11 +172,11 @@ def reward_checkpoint(
 
 
 @pytest.fixture(scope="session")
-def sft_masking_example() -> dict:
+def sft_masking_example(base_checkpoint: Path) -> dict:
     """Expose one tokenized structured example for label-mask assertions."""
     from open_rlhf.runtime import load_tokenizer
 
-    tokenizer = load_tokenizer(MODEL_ID)
+    tokenizer = load_tokenizer(str(base_checkpoint))
     return _tokenize_structured_example(
         tokenizer,
         "Explain RLHF.",

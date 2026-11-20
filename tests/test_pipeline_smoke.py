@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from eval.run_eval import main as run_eval_main
 from eval.run_safety import main as run_safety_main
 from scripts.train_dpo import main as train_dpo_main
@@ -81,6 +83,26 @@ def test_ppo_training_smoke(processed_data_dir, sft_checkpoint, reward_checkpoin
     assert exit_code == 0
     assert_model_artifacts(output_dir)
     assert_model_artifacts(output_dir / "value_model")
+
+
+def test_ppo_requires_a_full_rollout(
+    processed_data_dir, sft_checkpoint, reward_checkpoint, tmp_path, monkeypatch
+):
+    # If validation regresses, fail immediately instead of hanging in TRL.
+    monkeypatch.setattr(
+        "trl.PPOTrainer.train", lambda self: pytest.fail("Empty rollout reached training")
+    )
+    with pytest.raises(ValueError, match="2 prompts cannot fill a PPO rollout batch of 4"):
+        train_ppo_main(
+            [
+                "--policy", str(sft_checkpoint),
+                "--reward_model_path", str(reward_checkpoint),
+                "--instruct_data", str(processed_data_dir / "instruct.jsonl"),
+                "--output_dir", str(tmp_path / "ppo"),
+                "--batch_size", "4",
+                "--device", "cpu",
+            ]
+        )
 
 
 def test_eval_smoke_writes_reports(sft_checkpoint, tmp_path):
