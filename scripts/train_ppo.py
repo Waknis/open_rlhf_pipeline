@@ -204,6 +204,13 @@ def main(argv: list[str] | None = None) -> int:
         eval_dataset=eval_dataset,
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
     )
+    # TRL repeatedly iterates this loader with drop_last=True. Without a
+    # complete rollout batch, it would wait forever for the first update.
+    if len(trainer.get_train_dataloader()) == 0:
+        raise ValueError(
+            f"{len(prepared_dataset)} prompts cannot fill a PPO rollout batch of "
+            f"{ppo_config.batch_size}. Add prompts or reduce --batch_size."
+        )
     trainer.train()
 
     policy_model.save_pretrained(str(args.output_dir))

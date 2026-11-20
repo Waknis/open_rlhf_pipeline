@@ -15,7 +15,11 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from open_rlhf.formatting import render_prompt, render_prompt_response  # noqa: E402
+from open_rlhf.formatting import (  # noqa: E402
+    render_prompt,
+    render_prompt_response,
+    tokenizer_uses_chat_template,
+)
 from open_rlhf.runtime import (  # noqa: E402
     add_runtime_args,
     ensure_tokenizer_has_padding,
@@ -102,29 +106,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _tokenize_structured_example(tokenizer, prompt: str, response: str, max_length: int) -> dict:
+    if max_length < 2:
+        raise ValueError("SFT max_length must allow at least one context token and one target.")
     prompt_text = render_prompt(tokenizer, prompt)
     full_text = render_prompt_response(tokenizer, prompt, response)
+    if tokenizer_uses_chat_template(tokenizer):
+        # The template may omit the assistant header from its generation prompt,
+        # or add a prefill only at inference. Locate the training header itself.
+        marker = "__open_rlhf_response_boundary__"
+        marked_transcript = render_prompt_response(tokenizer, prompt, marker)
+        prefix, found, suffix = marked_transcript.rpartition(marker)
+        if found and full_text == prefix + response.strip() + suffix:
+            # Preserve the generation boundary when only separator whitespace
+            # follows it. Byte-level tokenizers often merge a space with a word.
+            if not prefix.startswith(prompt_text) or prefix[len(prompt_text):].strip():
+                prompt_text = prefix.rstrip(" ")
+        elif not full_text.startswith(prompt_text):
+            raise ValueError("Cannot locate the assistant response in the rendered chat template.")
 
-    prompt_tokens = tokenizer(
-        prompt_text,
-        truncation=True,
-        max_length=max_length,
-        add_special_tokens=False,
-    )
-    full_tokens = tokenizer(
-        full_text,
-        truncation=True,
-        max_length=max_length,
-        add_special_tokens=False,
-    )
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+    if full_ids[:len(prompt_ids)] == prompt_ids:
+        response_ids = full_ids[len(prompt_ids):]
+    else:
+        # A subword can span the text boundary. Keep the exact generation prefix
+        # and encode its continuation separately so no prompt token is a target.
+        response_ids = tokenizer(full_text[len(prompt_text):], add_special_tokens=False)["input_ids"]
+    if not prompt_ids or not response.strip() or not response_ids:
+        raise ValueError("A structured SFT row must contain context and a tokenizable response.")
 
-    labels = list(full_tokens["input_ids"])
-    prompt_length = min(len(prompt_tokens["input_ids"]), len(labels))
-    labels[:prompt_length] = [-100] * prompt_length
+    # When both sides are long, reserve half the window for the response. A
+    # shorter side gives its unused space to the other. Keep recent context
+    # and the beginning of the response, as at generation time.
+    response_budget = max(max_length // 2, max_length - len(prompt_ids))
+    response_ids = response_ids[:response_budget]
+    prompt_ids = prompt_ids[-(max_length - len(response_ids)):]
+    input_ids = prompt_ids + response_ids
     return {
-        "input_ids": list(full_tokens["input_ids"]),
-        "attention_mask": list(full_tokens["attention_mask"]),
-        "labels": labels,
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": [-100] * len(prompt_ids) + response_ids,
     }
 
 

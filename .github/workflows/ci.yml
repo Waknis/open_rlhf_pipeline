@@ -32,5 +32,4 @@ jobs:
           python -m compileall open_rlhf scripts eval web_demo
 
       - name: Run pipeline smoke tests
-        run: |
-          python -m pytest -q
+        run: bash tools/smoke_test.sh
